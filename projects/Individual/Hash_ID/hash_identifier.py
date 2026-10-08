@@ -56,6 +56,9 @@ O que este arquivo expõe
 # objeto amigável para não termos que fatiar `sys.argv` manualmente.
 import argparse
 
+from pathlib import Path
+import json
+
 # Biblioteca padrão: acesso a internos do interpretador — usamos para
 # escrever no stderr e sair do processo com um código de status específico.
 import sys
@@ -117,6 +120,11 @@ class HashCandidate:
     algorithm: str
     confidence: Confidence
     reason: str
+    hashcat_mode: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.hashcat_mode is None:
+            object.__setattr__(self, "hashcat_mode", HASHCAT_MODES.get(self.algorithm))
 
 
 # =============================================================================
@@ -168,7 +176,25 @@ PREFIX_RULES: list[tuple[str, str, str]] = [
     ("{SMD5}", "LDAP SMD5", "MD5 com salt do LDAP (carga base64)"),
     ("{MD5}", "LDAP MD5", "MD5 do LDAP (carga base64)"),
     ("{CRYPT}", "LDAP CRYPT", "LDAP envolvendo um hash crypt(3)"),
+    ("$pbkdf2$", "PBKDF2-SHA1 (Atlassian)", "formato antigo do Atlassian"),
 ]
+
+
+HASHCAT_MODES: dict[str, int] = {
+    "Argon2id": 34000,
+    "Argon2i": 34000,
+    "Argon2d": 34000,
+    "bcrypt": 3200,
+    "SHA-512 crypt": 1800,
+    "SHA-256 crypt": 7400,
+    "MD5 crypt": 500,
+    "Apache MD5-crypt": 1600,
+    "phpass": 400,
+    "Drupal 7 (SHA-512)": 7900,
+    "scrypt": 8900,
+    "Django PBKDF2-SHA256": 10000,
+    "PBKDF2-SHA1 (Atlassian)": 12001,
+}
 
 
 # =============================================================================
@@ -199,6 +225,8 @@ HEX_LENGTH_RULES: dict[int, list[str]] = {
     48: ["Tiger-192"],
     # 56 caracteres hex = 28 bytes = 224 bits
     56: ["SHA-224", "SHA3-224"],
+    # 24 caracteres hex = 12 bytes = 96 bits
+    24: ["Tiger-128"],
     # 64 caracteres hex = 32 bytes = 256 bits
     64: ["SHA-256", "SHA3-256", "BLAKE2s-256", "RIPEMD-256"],
     # 80 caracteres hex = 40 bytes = 320 bits (incomum)
@@ -251,6 +279,19 @@ _DESCRYPT_CHARSET: frozenset[str] = frozenset(
     "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
 _DESCRYPT_TOTAL_LENGTH = 13
+
+_BASE58_CHARSET: frozenset[str] = frozenset(
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+)
+_BASE32_CHARSET: frozenset[str] = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+
+
+def _is_base58(text: str) -> bool:
+    return len(text) > 8 and all(c in _BASE58_CHARSET for c in text)
+
+
+def _is_base32(text: str) -> bool:
+    return len(text) > 8 and all(c in _BASE32_CHARSET for c in text)
 
 
 def _is_descrypt(text: str) -> bool:
@@ -409,7 +450,10 @@ def identify(raw_input: str) -> list[HashCandidate]:
                     HashCandidate(
                         algorithm=f"String PHC ({algo_name})",
                         confidence="low",
-                        reason=f"formato `${algo_name}$...` — PHC genérico, sem regra específica",
+                        reason=(
+                            f"formato `${algo_name}$...` — PHC genérico, "
+                            "sem regra específica"
+                        ),
                     )
                 ]
 
@@ -423,6 +467,46 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 algorithm="JWT (não é um hash)",
                 confidence="low",
                 reason='prefixo `eyJ` é o base64 de `{"` — JWT, não é um hash',
+            )
+        ]
+    if text.startswith(("http://", "https://")):
+        return [
+            HashCandidate(
+                algorithm="URL (não é um hash)",
+                confidence="low",
+                reason="começa com um esquema de URL",
+            )
+        ]
+    if "@" in text and " " not in text:
+        return [
+            HashCandidate(
+                algorithm="E-mail (não é um hash)",
+                confidence="low",
+                reason="contém um endereço de e-mail",
+            )
+        ]
+    if text.startswith("0x"):
+        return [
+            HashCandidate(
+                algorithm="Hex com prefixo 0x (não é um hash)",
+                confidence="low",
+                reason="começa com `0x`",
+            )
+        ]
+    if _is_base32(text):
+        return [
+            HashCandidate(
+                algorithm="Base32 (não é um hash)",
+                confidence="low",
+                reason="alfabeto Base32",
+            )
+        ]
+    if _is_base58(text):
+        return [
+            HashCandidate(
+                algorithm="Base58 (não é um hash)",
+                confidence="low",
+                reason="alfabeto Base58",
             )
         ]
     if any(c in text for c in "+/=") and len(text) > 8:
@@ -457,7 +541,19 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "hash",
+        nargs="?",
         help="A string de hash a identificar (envolva em aspas simples se contiver $).",
+    )
+    parser.add_argument(
+        "--file",
+        "-f",
+        type=Path,
+        help="Arquivo com um hash por linha.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emite o resultado em JSON.",
     )
     parser.add_argument(
         "--top",
@@ -484,6 +580,7 @@ def _render_table(
     )
     table.add_column("algoritmo", style="bold white", no_wrap=True)
     table.add_column("confiança", no_wrap=True)
+    table.add_column("modo", no_wrap=True)
     table.add_column("motivo", style="dim")
 
     # Cores para os níveis de confiança.
@@ -497,9 +594,42 @@ def _render_table(
         table.add_row(
             candidate.algorithm,
             f"[{color}]{candidate.confidence}[/{color}]",
+            str(candidate.hashcat_mode or "-"),
             candidate.reason,
         )
     console.print(table)
+
+
+def _render_json(hash_value: str, candidates: list[HashCandidate]) -> str:
+    """
+    Devolve os candidatos em JSON formatado para consumo por programas.
+
+    `hash_value` recebe a entrada da CLI (por exemplo, `args.hash`) e cada
+    candidato usa os mesmos três campos que aparecem na tabela: algoritmo,
+    confiança e motivo. A função apenas monta a saída; quem a chama decide se
+    deve imprimi-la no terminal.
+    """
+    payload = {
+        "input": hash_value.strip(),
+        "candidates": [
+            {
+                "algorithm": candidate.algorithm,
+                "confidence": candidate.confidence,
+                "reason": candidate.reason,
+                "hashcat_mode": candidate.hashcat_mode,
+            }
+            for candidate in candidates
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _render_batch_line(value: str, candidates: list[HashCandidate], console: Console) -> None:
+    if candidates:
+        candidate = candidates[0]
+        console.print(f"{value.strip()}: {candidate.algorithm}")
+    else:
+        console.print(f"{value.strip()}: não identificado")
 
 
 def main() -> int:
@@ -510,28 +640,62 @@ def main() -> int:
     args = parser.parse_args()
     console = Console()
 
-    candidates = identify(args.hash)
+    hash_values: list[str] = []
 
-    if not candidates:
-        console.print(
-            "[red]Nenhuma identificação possível.[/red] "
-            "A entrada não correspondeu a nenhum prefixo conhecido, formato especial "
-            "ou comprimento hexadecimal."
-        )
-        return 1
+    if args.hash and args.file:
+        parser.error("use um hash, --file ou stdin; não combine hash e --file")
 
-    # Limita aos top-N solicitados
-    trimmed = candidates[: args.top]
-    _render_table(args.hash, trimmed, console)
+    if args.hash:
+        hash_values = [args.hash]
+    elif args.file:
+        try:
+            hash_values = args.file.read_text(encoding="utf-8").splitlines()
+        except OSError as error:
+            parser.error(f"não foi possível ler {args.file}: {error}")
+    elif not sys.stdin.isatty():
+        hash_values = sys.stdin.read().splitlines()
+    else:
+        parser.error("forneça um hash, --file ou uma entrada por stdin")
 
-    # Dica útil — direciona o usuário para o cracker após a identificação.
-    if trimmed[0].confidence == "high":
-        console.print(
-            "\n[dim]Próximo passo: tente o modo de quebra correspondente "
-            "(veja ../../beginner/hash-cracker).[/dim]"
-        )
+    batch_mode = args.hash is None
+    exit_code = 0
+    json_outputs: list[str] = []
+    for hash_value in hash_values:
+        if not hash_value.strip():
+            continue
 
-    return 0
+        candidates = identify(hash_value)
+        trimmed = candidates[: args.top]
+        if args.json:
+            json_outputs.append(_render_json(hash_value, trimmed))
+        elif batch_mode:
+            _render_batch_line(hash_value, trimmed, console)
+        elif not candidates:
+            console.print(
+                "[red]Nenhuma identificação possível.[/red] "
+                "A entrada não correspondeu a nenhum prefixo conhecido, formato especial "
+                "ou comprimento hexadecimal."
+            )
+        else:
+            _render_table(hash_value, trimmed, console)
+            mode = trimmed[0].hashcat_mode
+            if trimmed[0].confidence == "high" and mode is not None:
+                console.print(
+                    f"[dim]Próximo passo: hashcat -m {mode} -a 0 "
+                    f"'{hash_value.strip()}' wordlist.txt[/dim]"
+                )
+
+        if not candidates:
+            exit_code = 1
+
+    if args.json:
+        if len(json_outputs) == 1:
+            output = json_outputs[0]
+        else:
+            output = "[\n" + ",\n".join(json_outputs) + "\n]"
+        console.print(output)
+
+    return exit_code
 
 
 # Guarda padrão "se invocado diretamente como script".
